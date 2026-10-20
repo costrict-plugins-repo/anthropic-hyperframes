@@ -1,0 +1,441 @@
+/**
+ * Thin S3 transport for the Lambda handler.
+ *
+ * The OSS distributed primitives are pure functions over local file paths;
+ * the Lambda handler bridges S3 ↔ Lambda's `/tmp` filesystem on each
+ * invocation. Functions here are intentionally narrow: parse a URI, download
+ * an object to a local path, upload a path/directory, tar-extract a planDir,
+ * tar-pack a planDir back out.
+ *
+ * Tar (not zip) for planDir transit:
+ *   - planDirs contain symlinks (extract stage materializes them but the
+ *     compiled/ subtree may include linked assets); tar preserves them, zip
+ *     does not.
+ *   - We use the `tar` npm package (pure JS over `node:zlib`) — AWS
+ *     Lambda's `nodejs:22` base image ships neither `tar` nor `unzip` in
+ *     `/usr/bin`, so a system-binary tar would ENOENT in the actual
+ *     deployment.
+ */
+
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname } from "node:path";
+import { pipeline } from "node:stream/promises";
+import {
+  CopyObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  type S3Client,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import * as tar from "tar";
+import { CONTENT_STORE_REFRESH_AFTER_DAYS, contentStoreUri } from "./contentStore.js";
+
+/** Parsed `s3://bucket/key` URI. */
+export interface S3Location {
+  bucket: string;
+  key: string;
+}
+
+/** Parse `s3://bucket/key/path` → `{ bucket, key }`. Throws on malformed input. */
+export function parseS3Uri(uri: string): S3Location {
+  if (!uri.startsWith("s3://")) {
+    throw new Error(`[s3Transport] expected s3:// URI, got: ${JSON.stringify(uri)}`);
+  }
+  const rest = uri.slice("s3://".length);
+  const slash = rest.indexOf("/");
+  if (slash === -1) {
+    throw new Error(`[s3Transport] missing key in s3 URI: ${JSON.stringify(uri)}`);
+  }
+  const bucket = rest.slice(0, slash);
+  const key = rest.slice(slash + 1);
+  if (!bucket || !key) {
+    throw new Error(`[s3Transport] empty bucket or key in s3 URI: ${JSON.stringify(uri)}`);
+  }
+  return { bucket, key };
+}
+
+/** Build `s3://bucket/key` from a location. */
+export function formatS3Uri(loc: S3Location): string {
+  return `s3://${loc.bucket}/${loc.key}`;
+}
+
+/** Stream an S3 object to a local file path. Throws if the body is missing. */
+export async function downloadS3ObjectToFile(
+  client: S3Client,
+  uri: string,
+  destPath: string,
+): Promise<void> {
+  const { bucket, key } = parseS3Uri(uri);
+  const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const body = response.Body as NodeJS.ReadableStream | undefined;
+  if (!body) {
+    throw new Error(`[s3Transport] s3 GetObject returned empty body for ${uri}`);
+  }
+  mkdirSync(dirname(destPath), { recursive: true });
+  await pipeline(body, createWriteStream(destPath));
+}
+
+/** Download and verify an immutable plan-v2 artifact before materialization. */
+export async function downloadS3ObjectToFileVerified(
+  client: S3Client,
+  uri: string,
+  destPath: string,
+  expectedSha256: string,
+): Promise<void> {
+  assertSha256(expectedSha256);
+  await downloadS3ObjectToFile(client, uri, destPath);
+  const actual = await sha256File(destPath);
+  if (actual !== expectedSha256) {
+    rmSync(destPath, { force: true });
+    const error = new Error(
+      `[s3Transport] PLAN_ARTIFACT_DIGEST_MISMATCH: ${uri} expected ${expectedSha256}, got ${actual}`,
+    );
+    error.name = "PLAN_ARTIFACT_DIGEST_MISMATCH";
+    throw error;
+  }
+}
+
+/**
+ * Pre-sign a GET for a plan-v2 artifact, after S3 attests the object's stored
+ * SHA-256 and size are the ones the manifest pins.
+ */
+export async function presignVerifiedS3GetUrl(
+  client: S3Client,
+  uri: string,
+  expectedSha256: string,
+  expectedSize: number,
+  expiresInSeconds: number,
+): Promise<string> {
+  assertSha256(expectedSha256);
+  const { bucket, key } = parseS3Uri(uri);
+  const head = await client.send(
+    new HeadObjectCommand({ Bucket: bucket, Key: key, ChecksumMode: "ENABLED" }),
+  );
+  const expectedChecksum = Buffer.from(expectedSha256, "hex").toString("base64");
+  if (head.ChecksumSHA256 !== expectedChecksum || head.ContentLength !== expectedSize) {
+    const error = new Error(
+      `[s3Transport] PLAN_ARTIFACT_DIGEST_MISMATCH: ${uri} expected ${expectedSha256} (${expectedSize} bytes), S3 holds checksum ${String(head.ChecksumSHA256)} (${String(head.ContentLength)} bytes)`,
+    );
+    error.name = "PLAN_ARTIFACT_DIGEST_MISMATCH";
+    throw error;
+  }
+  return getSignedUrl(client, new GetObjectCommand({ Bucket: bucket, Key: key }), {
+    expiresIn: expiresInSeconds,
+  });
+}
+
+/**
+ * Upload a local file's contents to an S3 URI using a streaming
+ * `PutObjectCommand`. PutObject's 5 GB cap comfortably exceeds the
+ * distributed pipeline's 2 GB planDir limit and the typical
+ * chunk size (≤ 200 MB), so a single PUT works for every artifact this
+ * adapter handles.
+ */
+export async function uploadFileToS3(
+  client: S3Client,
+  localPath: string,
+  uri: string,
+  contentType?: string,
+): Promise<void> {
+  if (!existsSync(localPath)) {
+    throw new Error(`[s3Transport] upload source missing: ${localPath}`);
+  }
+  const { bucket, key } = parseS3Uri(uri);
+  const size = statSync(localPath).size;
+  await client.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: createReadStream(localPath),
+      ContentType: contentType,
+      ContentLength: size,
+    }),
+  );
+}
+
+/**
+ * Upload one content-addressed plan-v2 artifact exactly once; S3 verifies the bytes against
+ * `ChecksumSHA256`. An existing object is reused only when its digest metadata and length agree,
+ * and a conflicting one is never overwritten, since a chunk may already be reading that plan.
+ */
+export async function uploadContentAddressedFileToS3(
+  client: S3Client,
+  localPath: string,
+  uri: string,
+  expectedSha256: string,
+  contentType?: string,
+): Promise<"uploaded" | "reused"> {
+  return (await putImmutableFile(client, localPath, uri, expectedSha256, contentType)).outcome;
+}
+
+async function putImmutableFile(
+  client: S3Client,
+  localPath: string,
+  uri: string,
+  expectedSha256: string,
+  contentType?: string,
+): Promise<{ outcome: "uploaded" | "reused"; lastModified?: Date }> {
+  assertSha256(expectedSha256);
+  if (!existsSync(localPath)) {
+    throw new Error(`[s3Transport] upload source missing: ${localPath}`);
+  }
+  const { bucket, key } = parseS3Uri(uri);
+  const size = statSync(localPath).size;
+  const existing = await inspectContentAddressedObject(client, bucket, key, size, expectedSha256);
+  if (existing.state === "matching")
+    return { outcome: "reused", lastModified: existing.lastModified };
+  if (existing.state === "conflict") throwImmutableObjectConflict(uri);
+
+  const body = createReadStream(localPath);
+  try {
+    await client.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: body,
+        ContentType: contentType,
+        ContentLength: size,
+        Metadata: { sha256: expectedSha256 },
+        ChecksumSHA256: Buffer.from(expectedSha256, "hex").toString("base64"),
+        // HEAD followed by an unconditional PUT can overwrite a conflicting
+        // object published by a concurrent planner. Conditional create makes
+        // immutable CAS and fixed-key manifest publication race-safe.
+        IfNoneMatch: "*",
+      }),
+    );
+    return { outcome: "uploaded" };
+  } catch (error) {
+    if (!isS3PreconditionFailed(error)) throw error;
+    const raced = await inspectContentAddressedObject(client, bucket, key, size, expectedSha256);
+    if (raced.state === "matching") return { outcome: "reused" };
+    if (raced.state === "conflict") throwImmutableObjectConflict(uri);
+    // The winning object was deleted between the conditional failure and
+    // verification. Preserve the service error so the orchestrator may retry.
+    throw error;
+  } finally {
+    // A failed conditional request may reject before consuming the stream.
+    // Explicit teardown avoids retaining the source descriptor on a warm
+    // Lambda planner.
+    body.destroy();
+  }
+}
+
+export async function mapConcurrent<T>(
+  values: readonly T[],
+  concurrency: number,
+  fn: (value: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < values.length) {
+      const index = cursor++;
+      await fn(values[index]!);
+    }
+  }
+  const results = await Promise.allSettled(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
+  );
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  // Do not reject while sibling workers may still be writing into invocation
+  // scratch. The caller removes that directory in `finally`; draining the pool
+  // first prevents late S3 streams from racing cleanup after another GET fails.
+  if (failure) throw failure.reason;
+}
+
+export async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) {
+    hash.update(chunk as Buffer);
+  }
+  return hash.digest("hex");
+}
+
+function assertSha256(value: string): void {
+  if (!/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(
+      `[s3Transport] expected lowercase SHA-256 digest, got ${JSON.stringify(value)}`,
+    );
+  }
+}
+
+type ContentAddressedObjectState =
+  | { state: "missing" | "conflict" }
+  | { state: "matching"; lastModified?: Date };
+
+async function inspectContentAddressedObject(
+  client: S3Client,
+  bucket: string,
+  key: string,
+  expectedSize: number,
+  expectedSha256: string,
+): Promise<ContentAddressedObjectState> {
+  try {
+    const existing = await client.send(
+      new HeadObjectCommand({ Bucket: bucket, Key: key, ChecksumMode: "ENABLED" }),
+    );
+    return existing.ContentLength === expectedSize && existing.Metadata?.sha256 === expectedSha256
+      ? { state: "matching", lastModified: existing.LastModified }
+      : { state: "conflict" };
+  } catch (error) {
+    if (isS3NotFound(error)) return { state: "missing" };
+    throw error;
+  }
+}
+
+/** Put a file into the shared content store once; reusing an aging object restarts its expiry. */
+export async function putContentStoreFile(
+  client: S3Client,
+  localPath: string,
+  bucket: string,
+  sha256: string,
+): Promise<"uploaded" | "reused"> {
+  const uri = contentStoreUri(bucket, sha256);
+  const { outcome, lastModified } = await putImmutableFile(client, localPath, uri, sha256);
+  if (lastModified) await refreshAgingObject(client, uri, sha256, lastModified);
+  return outcome;
+}
+
+/** Confirm an object the caller never uploaded is in the content store, restarting an aging one. */
+export async function ensureContentStoreObject(
+  client: S3Client,
+  bucket: string,
+  sha256: string,
+  sizeBytes: number,
+): Promise<void> {
+  const uri = contentStoreUri(bucket, sha256);
+  const { key } = parseS3Uri(uri);
+  const existing = await inspectContentAddressedObject(client, bucket, key, sizeBytes, sha256);
+  if (existing.state === "matching") {
+    if (existing.lastModified) await refreshAgingObject(client, uri, sha256, existing.lastModified);
+    return;
+  }
+  if (existing.state === "conflict") throwImmutableObjectConflict(uri);
+  const error = new Error(
+    `[s3Transport] PLAN_ARTIFACT_MISSING: ${uri} is not in the content store`,
+  );
+  error.name = "PLAN_ARTIFACT_MISSING";
+  throw error;
+}
+
+export async function presignS3GetUrl(
+  client: S3Client,
+  uri: string,
+  expiresInSeconds: number,
+): Promise<string> {
+  const { bucket, key } = parseS3Uri(uri);
+  return getSignedUrl(client, new GetObjectCommand({ Bucket: bucket, Key: key }), {
+    expiresIn: expiresInSeconds,
+  });
+}
+
+// S3 lifecycle expiry counts from the last write, not the last read, so reuse has to write.
+async function refreshAgingObject(
+  client: S3Client,
+  uri: string,
+  sha256: string,
+  lastModified: Date,
+): Promise<void> {
+  const { bucket, key } = parseS3Uri(uri);
+  const ageMs = Date.now() - lastModified.getTime();
+  if (ageMs < CONTENT_STORE_REFRESH_AFTER_DAYS * 86_400_000) return;
+  await client.send(
+    new CopyObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      CopySource: `${bucket}/${key}`,
+      MetadataDirective: "REPLACE",
+      Metadata: { sha256 },
+      ChecksumAlgorithm: "SHA256",
+    }),
+  );
+}
+
+function throwImmutableObjectConflict(uri: string): never {
+  const error = new Error(
+    `[s3Transport] PLAN_ARTIFACT_DIGEST_MISMATCH: immutable object ${uri} already exists with different digest metadata or size`,
+  );
+  error.name = "PLAN_ARTIFACT_DIGEST_MISMATCH";
+  throw error;
+}
+
+export async function s3ObjectExists(client: S3Client, uri: string): Promise<boolean> {
+  const { bucket, key } = parseS3Uri(uri);
+  try {
+    await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+    return true;
+  } catch (error) {
+    if (isS3NotFound(error)) return false;
+    throw error;
+  }
+}
+
+export function isS3NotFound(error: unknown): boolean {
+  if (!isRecord(error)) return false;
+  const metadata = isRecord(error.$metadata) ? error.$metadata : undefined;
+  return (
+    error.name === "NotFound" || error.name === "NoSuchKey" || metadata?.httpStatusCode === 404
+  );
+}
+
+function isS3PreconditionFailed(error: unknown): boolean {
+  if (!isRecord(error)) return false;
+  const metadata = isRecord(error.$metadata) ? error.$metadata : undefined;
+  return error.name === "PreconditionFailed" || metadata?.httpStatusCode === 412;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Pack a directory into a `.tar.gz` at `destTarball`. Uses the `tar` npm
+ * package (pure JS over `node:zlib`) rather than spawning a system tar
+ * binary — the AWS Lambda Node 22 base image ships a minimal set of
+ * userland tools and does NOT include `tar` in `/usr/bin`.
+ */
+export async function tarDirectory(
+  sourceDir: string,
+  destTarball: string,
+  files?: string[],
+): Promise<void> {
+  if (!existsSync(sourceDir) || !statSync(sourceDir).isDirectory()) {
+    throw new Error(`[s3Transport] tar source must be an existing directory: ${sourceDir}`);
+  }
+  mkdirSync(dirname(destTarball), { recursive: true });
+  // `files` (relative to `sourceDir`) packs exactly those paths, with symlinks followed.
+  await tar.create(
+    { gzip: true, file: destTarball, cwd: sourceDir, follow: files !== undefined },
+    files ?? ["."],
+  );
+}
+
+/**
+ * Extract a `.tar.gz` produced by {@link tarDirectory} into `destDir`.
+ * The directory is created (or cleared) before extraction so a retried
+ * invocation doesn't observe stale files from a prior run on the same
+ * warm Lambda container.
+ */
+export async function untarDirectory(tarballPath: string, destDir: string): Promise<void> {
+  if (!existsSync(tarballPath)) {
+    throw new Error(`[s3Transport] tarball missing: ${tarballPath}`);
+  }
+  // Wipe target so the warm container's prior planDir doesn't bleed into
+  // the new invocation. Lambda re-uses /tmp across invocations on the same
+  // container.
+  if (existsSync(destDir)) {
+    rmSync(destDir, { recursive: true, force: true });
+  }
+  mkdirSync(destDir, { recursive: true });
+  await tar.extract({ file: tarballPath, cwd: destDir });
+}
