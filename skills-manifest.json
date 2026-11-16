@@ -1,0 +1,41 @@
+{
+  "source": "heygen-com/hyperframes",
+  "skills": {
+    "figma": {
+      "hash": "674455e54a2df3f5",
+      "files": 3
+    },
+    "hyperframes": {
+      "hash": "90b4e96c091ebe16",
+      "files": 80
+    },
+    "hyperframes-cli": {
+      "hash": "a1b8be77ce157ce4",
+      "files": 13
+    },
+    "hyperframes-registry": {
+      "hash": "560a5f11064f82c9",
+      "files": 13
+    },
+    "media-use": {
+      "hash": "fa655ce936dab4a5",
+      "files": 128
+    },
+    "remotion-to-hyperframes": {
+      "hash": "e7982839c333759e",
+      "files": 76
+    },
+    "reverse-any-video": {
+      "hash": "addcf365498eb4aa",
+      "files": 5
+    },
+    "slideshow": {
+      "hash": "c022f24e53ce376a",
+      "files": 2
+    },
+    "style-sampling": {
+      "hash": "5378b0a22d46cd0d",
+      "files": 2
+    }
+  }
+}
